@@ -8,6 +8,9 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Serilog;
 using System.Text;
 using AuthService.Data;
+using System.Security.Claims;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Storage;
 var builder = WebApplication.CreateBuilder(args);
 
 // ---------------- LOGGING ----------------
@@ -15,9 +18,14 @@ builder.Host.UseSerilog((ctx, lc) =>
     lc.WriteTo.Console());
 
 // ---------------- DATABASE ----------------
-builder.Services.AddDbContext<AuthDbContext>(options =>
-    options.UseSqlite("Data Source=auth.db"));
+// builder.Services.AddDbContext<AuthDbContext>(options =>
+//     options.UseSqlite("Data Source=/app/data/auth.db"));
 
+// Program.cs
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+
+builder.Services.AddDbContext<AuthDbContext>(options =>
+    options.UseSqlServer(connectionString));
 // ---------------- IDENTITY ----------------
 
 builder.Services
@@ -30,61 +38,110 @@ var jwtKey = builder.Configuration["Jwt:Key"]
              ?? "dev_secret_key_very_long_string_for_hs256_algorithm";
 
 
-builder.Services.AddAuthentication("Bearer")
+builder.Services
+    .AddAuthentication("Bearer")
     .AddJwtBearer("Bearer", options =>
     {
         options.TokenValidationParameters = new TokenValidationParameters
         {
             ValidateIssuer = true,
+            ValidIssuer = "auth-service",
+
             ValidateAudience = true,
-            ValidateLifetime = true,
+            ValidAudience = "api-clients",
+
             ValidateIssuerSigningKey = true,
-            ValidIssuer = builder.Configuration["Jwt:Issuer"],
-            ValidAudience = builder.Configuration["Jwt:Audience"],
-            IssuerSigningKey = new SymmetricSecurityKey(
-                Encoding.UTF8.GetBytes(builder.Configuration["Jwt:Key"]!)
-            )
+            IssuerSigningKey =
+                new SymmetricSecurityKey(
+                    Encoding.UTF8.GetBytes(
+                        builder.Configuration["Jwt:Key"]!
+                    )),
+
+            ValidateLifetime = true,
+            ClockSkew = TimeSpan.Zero
         };
     });
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("Frontend", policy =>
+    {
+        policy
+            .WithOrigins("http://localhost:5173")
+            .AllowAnyHeader()
+            .AllowAnyMethod();
+            // .AllowCredentials();
+    });
+});
 
 builder.Services.AddAuthorization();
 
 var app = builder.Build();
-
+// ... after builder.Build() ...
+// Place this after var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
-    var db = scope.ServiceProvider.GetRequiredService<AuthDbContext>();
-    db.Database.EnsureCreated();
-
-    var userManager = scope.ServiceProvider.GetRequiredService<UserManager<IdentityUser>>();
-
-    var email = "user@email.com";
-    var password = "Password@123";
-
-    var user = await userManager.FindByEmailAsync(email);
-    if (user == null)
+    var services = scope.ServiceProvider;
+    try
     {
-        user = new IdentityUser
+        var context = services.GetRequiredService<AuthDbContext>();
+        
+        // This is the critical part: 
+        // RelationalDatabaseCreator can force the creation of the physical DB
+        var dbCreator = context.GetService<IRelationalDatabaseCreator>();
+        
+        if (!dbCreator.Exists()) 
         {
-            UserName = email,
-            Email = email,
-            EmailConfirmed = true
-        };
-
-        var result = await userManager.CreateAsync(user, password);
-        if (!result.Succeeded)
-        {
-            Console.WriteLine("❌ Failed to create seed user");
-            foreach (var e in result.Errors)
-                Console.WriteLine(e.Description);
+            dbCreator.Create();
+            Console.WriteLine("Physical Database 'AuthDb' created.");
         }
-        else
+        
+        if (!dbCreator.HasTables()) 
         {
-            Console.WriteLine("✅ Seed user created");
+            dbCreator.CreateTables();
+            Console.WriteLine("Tables created successfully.");
         }
+        
+        // Alternative: context.Database.Migrate(); 
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Migration/Creation Error: {ex.Message}");
     }
 }
+// using (var scope = app.Services.CreateScope())
+// {
+//     var db = scope.ServiceProvider.GetRequiredService<AuthDbContext>();
+//     db.Database.EnsureCreated();
 
+//     var userManager = scope.ServiceProvider.GetRequiredService<UserManager<IdentityUser>>();
+
+//     var email = "user@email.com";
+//     var password = "Password@123";
+
+//     var user = await userManager.FindByEmailAsync(email);
+//     if (user == null)
+//     {
+//         user = new IdentityUser
+//         {
+//             UserName = email,
+//             Email = email,
+//             EmailConfirmed = true
+//         };
+
+//         var result = await userManager.CreateAsync(user, password);
+//         if (!result.Succeeded)
+//         {
+//             Console.WriteLine("❌ Failed to create seed user");
+//             foreach (var e in result.Errors)
+//                 Console.WriteLine(e.Description);
+//         }
+//         else
+//         {
+//             Console.WriteLine("✅ Seed user created");
+//         }
+//     }
+// }
+app.UseCors("Frontend");
 app.UseAuthentication();
 app.UseAuthorization();
 
@@ -107,73 +164,89 @@ app.MapPost("/auth/login", async (
     if (!await userManager.CheckPasswordAsync(user, request.Password))
         return Results.Unauthorized();
 
-    // MFA / OTP
+    // 🔐 MFA ENFORCEMENT
     if (await userManager.GetTwoFactorEnabledAsync(user))
     {
         if (string.IsNullOrEmpty(request.Otp))
             return Results.BadRequest("OTP required");
 
-        var validOtp =
+        var isValidOtp =
             await userManager.VerifyTwoFactorTokenAsync(
                 user,
                 TokenOptions.DefaultAuthenticatorProvider,
-                request.Otp);
+                request.Otp
+            );
 
-        if (!validOtp)
+        if (!isValidOtp)
             return Results.Unauthorized();
     }
 
-    var token = JwtTokenGenerator.Generate(user.Email, jwtKey);
+    var token = JwtTokenGenerator.Generate(
+    user.Id,
+    user.Email!,
+    builder.Configuration["Jwt:Key"]!
+);
     return Results.Ok(new { token });
 });
 
 app.MapPost("/auth/mfa/setup", async (
     UserManager<IdentityUser> userManager,
-    HttpContext http) =>
+    ClaimsPrincipal user) =>
 {
-    // 🔐 Identify user from JWT
-    var email = http.User.Claims
-        .FirstOrDefault(c => c.Type.Contains("email"))?.Value;
-
-    if (email is null)
+    var identityUser = await userManager.GetUserAsync(user);
+    if (identityUser == null)
         return Results.Unauthorized();
 
-    var user = await userManager.FindByEmailAsync(email);
-    if (user is null)
-        return Results.Unauthorized();
+    // Reset old key (important)
+    await userManager.ResetAuthenticatorKeyAsync(identityUser);
 
-    // Generate MFA secret
-    var key = await userManager.GetAuthenticatorKeyAsync(user);
-    if (string.IsNullOrEmpty(key))
-        await userManager.ResetAuthenticatorKeyAsync(user);
-
-    key = await userManager.GetAuthenticatorKeyAsync(user);
+    var key = await userManager.GetAuthenticatorKeyAsync(identityUser);
 
     var otpUri =
-        $"otpauth://totp/ContainerizedApp:{email}" +
-        $"?secret={key}&issuer=ContainerizedApp";
-
-    // Generate QR code
-    var qrGenerator = new QRCodeGenerator();
-    var qrData = qrGenerator.CreateQrCode(otpUri, QRCodeGenerator.ECCLevel.Q);
-    var qrCode = new PngByteQRCode(qrData);
-    var qrBytes = qrCode.GetGraphic(20);
+        $"otpauth://totp/ContainerizedApp:{identityUser.Email}" +
+        $"?secret={key}&issuer=ContainerizedApp&digits=6";
 
     return Results.Ok(new
     {
         sharedKey = key,
-        qrCode = Convert.ToBase64String(qrBytes)
+        otpAuthUri = otpUri
     });
 })
 .RequireAuthorization();
+app.MapPost("/auth/register", async (
+        RegisterRequest request,
+        UserManager<IdentityUser> userManager
+    ) =>
+    {
+    var existingUser = await userManager.FindByEmailAsync(request.Email);
+    if (existingUser != null)
+        return Results.BadRequest("User already exists");
 
+    var user = new IdentityUser
+    {
+        UserName = request.Email,
+        Email = request.Email,
+        EmailConfirmed = true
+    };
+
+    var result = await userManager.CreateAsync(user, request.Password);
+
+    if (!result.Succeeded)
+    {
+        return Results.BadRequest(result.Errors.Select(e => e.Description));
+    }
+
+    return Results.Ok(new
+    {
+        message = "User registered successfully"
+    });
+});
 app.MapPost("/auth/mfa/verify", async (
-    VerifyMfaRequest request,
+    MfaVerifyRequest request,
     UserManager<IdentityUser> userManager,
-    HttpContext http) =>
+    ClaimsPrincipal userPrincipal) =>
 {
-    var email = http.User.Claims
-        .FirstOrDefault(c => c.Type.Contains("email"))?.Value;
+    var email = userPrincipal.FindFirstValue(ClaimTypes.Email);
 
     if (email is null)
         return Results.Unauthorized();
@@ -185,20 +258,20 @@ app.MapPost("/auth/mfa/verify", async (
     var isValid = await userManager.VerifyTwoFactorTokenAsync(
         user,
         TokenOptions.DefaultAuthenticatorProvider,
-        request.Code);
+        request.Code
+    );
 
     if (!isValid)
-        return Results.BadRequest("Invalid OTP");
+        return Results.Unauthorized();
 
     await userManager.SetTwoFactorEnabledAsync(user, true);
 
-    return Results.Ok("MFA enabled");
+    return Results.Ok(new { message = "MFA enabled successfully" });
 })
 .RequireAuthorization();
-
 app.Run();
-
 // ---------------- MODELS ----------------
 record LoginRequest(string Email, string Password, string? Otp);
-record VerifyMfaRequest(string Code);
-
+record VerifyMfaRequest(string Otp);
+public record MfaVerifyRequest(string Code);
+record RegisterRequest(string Email, string Password);
