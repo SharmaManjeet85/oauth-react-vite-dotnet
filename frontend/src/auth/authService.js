@@ -30,4 +30,8 @@ export const verifyMfa = async (code) => {
 export const socialLogin = async (provider) => {
   const res = await api.get(`/auth/social/${provider}`);
   window.location.href = res.data.url;
-}
+};
+export const googleLogin = () => {
+  window.location.href = "http://localhost:5001/auth/google/login";
+};
+

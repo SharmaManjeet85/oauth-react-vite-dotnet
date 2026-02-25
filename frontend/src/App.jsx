@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { login, socialLogin } from "./auth/authService";
+import { login, socialLogin,googleLogin } from "./auth/authService";
 
 function App() {
   const [email, setEmail] = useState("");
@@ -21,7 +21,7 @@ const handleLogin = async () => {
 
       <hr />
 
-      <button onClick={() => socialLogin("google")}>Google</button>
+      <button onClick={() => googleLogin()}>Google</button>
       <button onClick={() => socialLogin("github")}>GitHub</button>
     </div>
   );

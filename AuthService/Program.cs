@@ -28,9 +28,17 @@ builder.Services.AddDbContext<AuthDbContext>(options =>
     options.UseSqlServer(connectionString));
 // ---------------- IDENTITY ----------------
 
+// builder.Services
+//     .AddIdentityCore<IdentityUser>()
+//     .AddEntityFrameworkStores<AuthDbContext>()
+//     .AddDefaultTokenProviders();
 builder.Services
-    .AddIdentityCore<IdentityUser>()
+    .AddIdentityCore<IdentityUser>(options =>
+    {
+        options.SignIn.RequireConfirmedEmail = false;
+    })
     .AddEntityFrameworkStores<AuthDbContext>()
+    .AddSignInManager()
     .AddDefaultTokenProviders();
 
 // ---------------- JWT ----------------
@@ -60,6 +68,17 @@ builder.Services
             ValidateLifetime = true,
             ClockSkew = TimeSpan.Zero
         };
+    })
+    .AddCookie(IdentityConstants.ExternalScheme)
+    .AddGoogle("Google", options =>
+    {
+        options.ClientId = builder.Configuration["Google:ClientId"]!;
+        options.ClientSecret = builder.Configuration["Google:ClientSecret"]!;
+
+        // IMPORTANT
+        options.CallbackPath = "/signin-google";
+
+        options.SignInScheme = IdentityConstants.ExternalScheme;
     });
 builder.Services.AddCors(options =>
 {
@@ -269,6 +288,69 @@ app.MapPost("/auth/mfa/verify", async (
     return Results.Ok(new { message = "MFA enabled successfully" });
 })
 .RequireAuthorization();
+app.MapGet("/auth/google/login", (
+    HttpContext httpContext
+) =>
+{
+    var props = new AuthenticationProperties
+    {
+        RedirectUri = "/auth/google/callback"
+    };
+
+    return Results.Challenge(props, new[] { "Google" });
+});
+app.MapGet("/auth/google/callback", async (
+    HttpContext httpContext,
+    UserManager<IdentityUser> userManager,
+    SignInManager<IdentityUser> signInManager
+) =>
+{
+    var result = await httpContext.AuthenticateAsync(
+        IdentityConstants.ExternalScheme
+    );
+
+    if (!result.Succeeded)
+        return Results.Unauthorized();
+
+    var email =
+        result.Principal?.FindFirstValue(ClaimTypes.Email);
+
+    if (email is null)
+        return Results.BadRequest("Email not provided by Google");
+
+    var user = await userManager.FindByEmailAsync(email);
+
+    if (user == null)
+    {
+        user = new IdentityUser
+        {
+            UserName = email,
+            Email = email,
+            EmailConfirmed = true
+        };
+
+        await userManager.CreateAsync(user);
+    }
+
+    // MFA CHECK
+    if (await userManager.GetTwoFactorEnabledAsync(user))
+    {
+        // redirect UI to OTP screen
+        return Results.Redirect(
+            $"http://localhost:5173/mfa?email={email}"
+        );
+    }
+
+    var token = JwtTokenGenerator.Generate(
+        user.Id,
+        user.Email!,
+        builder.Configuration["Jwt:Key"]!
+    );
+
+    return Results.Redirect(
+        $"http://localhost:5173/oauth-success?token={token}"
+    );
+});
 app.Run();
 // ---------------- MODELS ----------------
 record LoginRequest(string Email, string Password, string? Otp);
